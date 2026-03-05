@@ -13,11 +13,15 @@ dependencies = [
     "httpx>=0.27.0",
     "pdfplumber>=0.11.0",
     "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
     "qdrant-client>=1.9.0",
     "sentence-transformers>=3.0.0",
     "openai>=1.30.0",
     "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
     "python-dotenv>=1.0.0",
+    "zeep>=4.2.0",
+    "tiktoken>=0.7.0",
 ]
 
 [project.optional-dependencies]
@@ -27,3 +31,23 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
 ]
+
+[project.scripts]
+eurlex-ingest = "ingestion.pipeline:main"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "ingestion",
+    "embeddings",
+    "vectordb",
+    "rag",
+    "api",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
