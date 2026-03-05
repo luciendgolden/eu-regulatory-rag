@@ -35,6 +35,28 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = Field(default="", description="OpenAI API key")
 
+    # API authentication
+    api_key: str = Field(default="", description="API key for /api/v1/* endpoints")
+    admin_api_key: str = Field(
+        default="",
+        description="Admin API key for privileged endpoints (e.g. /ingest). "
+                    "Falls back to api_key when not set.",
+    )
+
+    # LLM
+    llm_provider: str = Field(
+        default="openai",
+        description="LLM provider: 'openai' or 'ollama'",
+    )
+    llm_model: str = Field(
+        default="gpt-4o",
+        description="LLM model name (e.g. gpt-4o, llama3)",
+    )
+    ollama_host: str = Field(
+        default="http://localhost:11434",
+        description="Ollama API base URL",
+    )
+
     @property
     def has_eurlex_credentials(self) -> bool:
         """True when SOAP credentials are configured."""
