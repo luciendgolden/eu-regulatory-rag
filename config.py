@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = Field(default="", description="OpenAI API key")
 
+    # API authentication
+    api_key: str = Field(default="", description="API key for /api/v1/* endpoints")
+    admin_api_key: str = Field(
+        default="",
+        description="Admin API key for privileged endpoints (e.g. /ingest). "
+                    "Falls back to api_key when not set.",
+    )
+
     @property
     def has_eurlex_credentials(self) -> bool:
         """True when SOAP credentials are configured."""
