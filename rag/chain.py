@@ -18,7 +18,7 @@ Streaming variant::
 from __future__ import annotations
 
 import logging
-from typing import Any, Generator, Iterator, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 from rag.prompt import assemble_prompt, format_citation
 
@@ -94,7 +94,12 @@ class RAGChain:
         """
         retriever = self._get_retriever()
 
-        logger.info("RAG query: %r (top_k=%d, regulation=%s)", question[:80], top_k, regulation)
+        logger.info(
+            "RAG query: %r (top_k=%d, regulation=%s)",
+            question[:80],
+            top_k,
+            regulation,
+        )
 
         # 1. Retrieve relevant chunks
         results = retriever.retrieve(
