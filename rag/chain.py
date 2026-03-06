@@ -2,7 +2,7 @@
 
 Public API
 ----------
->>> from rag.chain import RAGChain
+>>> from rag.chain import RAGChain, get_chain, query
 >>> chain = RAGChain()
 >>> result = chain.query("What are the ICT risk management requirements under DORA?")
 >>> print(result["answer"])
@@ -13,12 +13,21 @@ Streaming variant::
 
 >>> for chunk in chain.query("...", stream=True):
 ...     print(chunk, end="", flush=True)
+
+Async API (for FastAPI)::
+
+>>> result = await chain.aquery("What is NIS2?")
+>>> async for chunk in chain.astream_query("What is NIS2?"):
+...     print(chunk)
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import Any, Iterator, Optional, Union
+import time
+from typing import Any, AsyncIterator, Iterator, Optional, Union
 
 from rag.prompt import assemble_prompt, format_citation
 
@@ -51,20 +60,20 @@ class RAGChain:
 
     def _get_retriever(self):
         if self._retriever is None:
-            from rag.retriever import RegulatoryRetriever  # noqa: PLC0415
+            from rag.retriever import RegulatoryRetriever
 
             self._retriever = RegulatoryRetriever()
         return self._retriever
 
     def _get_llm(self):
         if self._llm is None:
-            from rag.llm import get_llm_service  # noqa: PLC0415
+            from rag.llm import get_llm_service
 
             self._llm = get_llm_service()
         return self._llm
 
     # ------------------------------------------------------------------
-    # Core query
+    # Sync query (for CLI / scripts)
     # ------------------------------------------------------------------
 
     def query(
@@ -76,17 +85,6 @@ class RAGChain:
         stream: bool = False,
     ) -> Union[dict[str, Any], Iterator[str]]:
         """Run the full RAG pipeline for *question*.
-
-        Args:
-            question:     The user's natural-language question.
-            regulation:   Optional filter (e.g. ``"DORA"`` or ``"NIS2"``).
-            section_type: Optional filter (e.g. ``"article"``).
-            top_k:        Number of context chunks to retrieve.
-            stream:       If ``True``, return a generator that yields answer
-                          chunks. The final yielded item is a special
-                          ``"__citations__"`` sentinel followed by JSON-encoded
-                          citations — callers that want citations in streaming
-                          mode should filter for it.
 
         Returns:
             * **Non-streaming** — ``{"answer": str, "citations": list[dict]}``
@@ -101,7 +99,6 @@ class RAGChain:
             regulation,
         )
 
-        # 1. Retrieve relevant chunks
         results = retriever.retrieve(
             query=question,
             regulation=regulation,
@@ -109,10 +106,7 @@ class RAGChain:
             top_k=top_k,
         )
 
-        # 2. Build citations list
         citations = _build_citations(results)
-
-        # 3. Assemble prompt
         system_prompt, user_message = assemble_prompt(question, results)
 
         llm = self._get_llm()
@@ -120,15 +114,10 @@ class RAGChain:
         if stream:
             return self._stream_query(llm, system_prompt, user_message, citations)
 
-        # 4. Call LLM (blocking)
         answer = llm.complete(system=system_prompt, user=user_message)
         logger.info("RAG answer generated (%d chars, %d citations)", len(answer), len(citations))
 
         return {"answer": answer, "citations": citations}
-
-    # ------------------------------------------------------------------
-    # Streaming helper
-    # ------------------------------------------------------------------
 
     def _stream_query(
         self,
@@ -138,17 +127,111 @@ class RAGChain:
         citations: list[dict[str, Any]],
     ) -> Iterator[str]:
         """Yield LLM chunks, then emit citations as a final sentinel."""
-        import json
-
         for chunk in llm.stream(system=system_prompt, user=user_message):
             yield chunk
-
-        # Yield citations as a structured sentinel for callers that need them
         yield f"\n__citations__:{json.dumps(citations)}"
+
+    # ------------------------------------------------------------------
+    # Async query (for FastAPI)
+    # ------------------------------------------------------------------
+
+    async def aquery(
+        self,
+        question: str,
+        regulation: Optional[str] = None,
+        section_type: Optional[str] = None,
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Async variant of :meth:`query` for use in FastAPI endpoints.
+
+        Returns ``{"answer": str, "sources": list[dict], "query_time_ms": int}``
+        """
+        t0 = time.monotonic()
+
+        retriever = self._get_retriever()
+        results = await asyncio.to_thread(
+            retriever.retrieve,
+            question,
+            regulation=regulation,
+            section_type=section_type,
+            top_k=top_k,
+        )
+
+        citations = _build_citations(results)
+        system_prompt, user_message = assemble_prompt(question, results)
+        llm = self._get_llm()
+
+        answer = await asyncio.to_thread(
+            llm.complete, system=system_prompt, user=user_message,
+        )
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        sources = [
+            {
+                "regulation": r["regulation"],
+                "section_type": r["section_type"],
+                "section_number": r.get("section_number"),
+                "section_title": r.get("section_title"),
+                "score": r["score"],
+            }
+            for r in results
+        ]
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "query_time_ms": elapsed_ms,
+        }
+
+    async def astream_query(
+        self,
+        question: str,
+        regulation: Optional[str] = None,
+        section_type: Optional[str] = None,
+        top_k: int = 5,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Async streaming variant — yields ``{"chunk": str}`` dicts,
+        then a final ``{"done": True, "sources": [...], "query_time_ms": N}``.
+        """
+        t0 = time.monotonic()
+
+        retriever = self._get_retriever()
+        results = await asyncio.to_thread(
+            retriever.retrieve,
+            question,
+            regulation=regulation,
+            section_type=section_type,
+            top_k=top_k,
+        )
+
+        citations = _build_citations(results)
+        system_prompt, user_message = assemble_prompt(question, results)
+        llm = self._get_llm()
+
+        for chunk in llm.stream(system=system_prompt, user=user_message):
+            yield {"chunk": chunk}
+
+        sources = [
+            {
+                "regulation": r["regulation"],
+                "section_type": r["section_type"],
+                "section_number": r.get("section_number"),
+                "section_title": r.get("section_title"),
+                "score": r["score"],
+            }
+            for r in results
+        ]
+
+        yield {
+            "done": True,
+            "sources": sources,
+            "query_time_ms": int((time.monotonic() - t0) * 1000),
+        }
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -177,10 +260,18 @@ def _article_label(result: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Module-level convenience function
+# Module-level convenience
 # ---------------------------------------------------------------------------
 
 _default_chain: Optional[RAGChain] = None
+
+
+def get_chain() -> RAGChain:
+    """Return the global :class:`RAGChain` instance (lazy init)."""
+    global _default_chain
+    if _default_chain is None:
+        _default_chain = RAGChain()
+    return _default_chain
 
 
 def query(
@@ -191,13 +282,25 @@ def query(
     stream: bool = False,
 ) -> Union[dict[str, Any], Iterator[str]]:
     """Convenience wrapper using a module-level singleton :class:`RAGChain`."""
-    global _default_chain
-    if _default_chain is None:
-        _default_chain = RAGChain()
-    return _default_chain.query(
+    return get_chain().query(
         question,
         regulation=regulation,
         section_type=section_type,
         top_k=top_k,
         stream=stream,
+    )
+
+
+async def aquery(
+    question: str,
+    regulation: Optional[str] = None,
+    section_type: Optional[str] = None,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Async convenience wrapper."""
+    return await get_chain().aquery(
+        question,
+        regulation=regulation,
+        section_type=section_type,
+        top_k=top_k,
     )
