@@ -110,6 +110,19 @@ class RegulatoryRetriever:
         logger.info("Retrieved %d results for query %r", len(results), query[:80])
         return results
 
+    def format_citation(self, result: dict[str, Any]) -> str:
+        """Public helper — format a single retrieval result as a citation string.
+
+        Delegates to the module-level :func:`_build_citation` helper so callers
+        do not need to import private functions.
+
+        Example::
+
+            retriever.format_citation(result)
+            # → "According to DORA — Article 5 (ICT risk management framework):"
+        """
+        return _build_citation(result)
+
     def build_context(self, results: list[dict[str, Any]]) -> str:
         """Format retrieved results into a structured context string.
 

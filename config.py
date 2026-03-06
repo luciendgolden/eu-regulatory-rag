@@ -35,6 +35,20 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = Field(default="", description="OpenAI API key")
 
+    # LLM
+    llm_provider: str = Field(
+        default="openai",
+        description="LLM provider: 'openai' or 'ollama'",
+    )
+    llm_model: str = Field(
+        default="gpt-4o",
+        description="LLM model name (e.g. gpt-4o, llama3)",
+    )
+    ollama_host: str = Field(
+        default="http://localhost:11434",
+        description="Ollama API base URL",
+    )
+
     # API authentication
     api_key: str = Field(default="", description="API key for /api/v1/* endpoints")
     admin_api_key: str = Field(

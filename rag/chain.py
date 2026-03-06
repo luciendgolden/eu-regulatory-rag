@@ -1,85 +1,170 @@
-"""RAG chain — orchestrates retriever + LLM to answer regulatory questions.
+"""RAG Chain — orchestrates embed → retrieve → prompt → LLM.
 
 Public API
 ----------
->>> from rag.chain import get_chain, query
->>> result = await query("What are the ICT risk management requirements under DORA?")
+>>> from rag.chain import RAGChain, get_chain, query
+>>> chain = RAGChain()
+>>> result = chain.query("What are the ICT risk management requirements under DORA?")
 >>> print(result["answer"])
+>>> for citation in result["citations"]:
+...     print(citation)
+
+Streaming variant::
+
+>>> for chunk in chain.query("...", stream=True):
+...     print(chunk, end="", flush=True)
+
+Async API (for FastAPI)::
+
+>>> result = await chain.aquery("What is NIS2?")
+>>> async for chunk in chain.astream_query("What is NIS2?"):
+...     print(chunk)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Iterator, Optional, Union
 
-from rag.retriever import RegulatoryRetriever
+from rag.prompt import assemble_prompt, format_citation
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Prompt template
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """You are a regulatory compliance expert specialising in EU financial and
-cybersecurity regulation (DORA, NIS2). Answer the user's question using ONLY the provided
-regulatory context. Cite specific articles or recitals. If the context does not contain
-enough information, say so clearly.
-
-Regulatory context:
-{context}"""
-
-_USER_TEMPLATE = "Question: {question}"
-
 
 # ---------------------------------------------------------------------------
-# RAG chain
+# RAGChain
 # ---------------------------------------------------------------------------
 
 
-class RegulatoryChain:
-    """End-to-end RAG chain: retrieve → prompt → generate."""
+class RAGChain:
+    """End-to-end RAG pipeline for EU regulatory queries.
+
+    Lazy-initialises the retriever and LLM service on first use so the class
+    can be imported without triggering network connections or heavy model loads.
+    """
 
     def __init__(
         self,
-        retriever: Optional[RegulatoryRetriever] = None,
+        retriever=None,
+        llm_service=None,
     ) -> None:
-        self._retriever = retriever or RegulatoryRetriever()
+        self._retriever = retriever
+        self._llm = llm_service
 
     # ------------------------------------------------------------------
-    # Public API
+    # Lazy initialisation
     # ------------------------------------------------------------------
 
-    async def query(
+    def _get_retriever(self):
+        if self._retriever is None:
+            from rag.retriever import RegulatoryRetriever
+
+            self._retriever = RegulatoryRetriever()
+        return self._retriever
+
+    def _get_llm(self):
+        if self._llm is None:
+            from rag.llm import get_llm_service
+
+            self._llm = get_llm_service()
+        return self._llm
+
+    # ------------------------------------------------------------------
+    # Sync query (for CLI / scripts)
+    # ------------------------------------------------------------------
+
+    def query(
         self,
         question: str,
         regulation: Optional[str] = None,
         section_type: Optional[str] = None,
         top_k: int = 5,
         stream: bool = False,
-    ) -> dict[str, Any]:
-        """Answer *question* and return a structured result dict.
+    ) -> Union[dict[str, Any], Iterator[str]]:
+        """Run the full RAG pipeline for *question*.
 
-        Returns::
-            {
-                "answer": str,
-                "sources": list[dict],
-                "query_time_ms": int,
-            }
+        Returns:
+            * **Non-streaming** — ``{"answer": str, "citations": list[dict]}``
+            * **Streaming** — ``Iterator[str]`` of text chunks
+        """
+        retriever = self._get_retriever()
+
+        logger.info(
+            "RAG query: %r (top_k=%d, regulation=%s)",
+            question[:80],
+            top_k,
+            regulation,
+        )
+
+        results = retriever.retrieve(
+            query=question,
+            regulation=regulation,
+            section_type=section_type,
+            top_k=top_k,
+        )
+
+        citations = _build_citations(results)
+        system_prompt, user_message = assemble_prompt(question, results)
+
+        llm = self._get_llm()
+
+        if stream:
+            return self._stream_query(llm, system_prompt, user_message, citations)
+
+        answer = llm.complete(system=system_prompt, user=user_message)
+        logger.info("RAG answer generated (%d chars, %d citations)", len(answer), len(citations))
+
+        return {"answer": answer, "citations": citations}
+
+    def _stream_query(
+        self,
+        llm,
+        system_prompt: str,
+        user_message: str,
+        citations: list[dict[str, Any]],
+    ) -> Iterator[str]:
+        """Yield LLM chunks, then emit citations as a final sentinel."""
+        for chunk in llm.stream(system=system_prompt, user=user_message):
+            yield chunk
+        yield f"\n__citations__:{json.dumps(citations)}"
+
+    # ------------------------------------------------------------------
+    # Async query (for FastAPI)
+    # ------------------------------------------------------------------
+
+    async def aquery(
+        self,
+        question: str,
+        regulation: Optional[str] = None,
+        section_type: Optional[str] = None,
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Async variant of :meth:`query` for use in FastAPI endpoints.
+
+        Returns ``{"answer": str, "sources": list[dict], "query_time_ms": int}``
         """
         t0 = time.monotonic()
 
+        retriever = self._get_retriever()
         results = await asyncio.to_thread(
-            self._retriever.retrieve,
+            retriever.retrieve,
             question,
             regulation=regulation,
             section_type=section_type,
             top_k=top_k,
         )
 
-        context = self._retriever.build_context(results)
-        answer = await asyncio.to_thread(self._generate, question, context)
+        citations = _build_citations(results)
+        system_prompt, user_message = assemble_prompt(question, results)
+        llm = self._get_llm()
+
+        answer = await asyncio.to_thread(
+            llm.complete, system=system_prompt, user=user_message,
+        )
+
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         sources = [
@@ -99,30 +184,32 @@ class RegulatoryChain:
             "query_time_ms": elapsed_ms,
         }
 
-    async def stream_query(
+    async def astream_query(
         self,
         question: str,
         regulation: Optional[str] = None,
         section_type: Optional[str] = None,
         top_k: int = 5,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream LLM response chunks as an async generator.
-
-        Yields dicts of shape ``{"chunk": str}`` followed by a final
-        ``{"done": True, "sources": [...], "query_time_ms": N}`` event.
+        """Async streaming variant — yields ``{"chunk": str}`` dicts,
+        then a final ``{"done": True, "sources": [...], "query_time_ms": N}``.
         """
         t0 = time.monotonic()
 
+        retriever = self._get_retriever()
         results = await asyncio.to_thread(
-            self._retriever.retrieve,
+            retriever.retrieve,
             question,
             regulation=regulation,
             section_type=section_type,
             top_k=top_k,
         )
-        context = self._retriever.build_context(results)
 
-        async for chunk in self._stream_generate(question, context):
+        citations = _build_citations(results)
+        system_prompt, user_message = assemble_prompt(question, results)
+        llm = self._get_llm()
+
+        for chunk in llm.stream(system=system_prompt, user=user_message):
             yield {"chunk": chunk}
 
         sources = [
@@ -136,112 +223,84 @@ class RegulatoryChain:
             for r in results
         ]
 
-        yield {"done": True, "sources": sources, "query_time_ms": int((time.monotonic() - t0) * 1000)}
-
-    # ------------------------------------------------------------------
-    # LLM helpers
-    # ------------------------------------------------------------------
-
-    def _generate(self, question: str, context: str) -> str:
-        try:
-            return self._openai_generate(question, context)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("OpenAI generation failed (%s); using stub answer.", exc)
-            return self._stub_answer(question, context)
-
-    async def _stream_generate(self, question: str, context: str) -> AsyncIterator[str]:
-        try:
-            async for chunk in self._openai_stream(question, context):
-                yield chunk
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("OpenAI streaming failed (%s); falling back to stub.", exc)
-            for word in self._stub_answer(question, context).split():
-                yield word + " "
-                await asyncio.sleep(0)
-
-    def _openai_generate(self, question: str, context: str) -> str:
-        from config import settings
-
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY not configured")
-
-        from openai import OpenAI  # type: ignore
-
-        client = OpenAI(api_key=settings.openai_api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT.format(context=context)},
-                {"role": "user", "content": _USER_TEMPLATE.format(question=question)},
-            ],
-            temperature=0.2,
-        )
-        return response.choices[0].message.content or ""
-
-    async def _openai_stream(self, question: str, context: str) -> AsyncIterator[str]:
-        from config import settings
-
-        if not settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY not configured")
-
-        from openai import AsyncOpenAI  # type: ignore
-
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
-        stream = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT.format(context=context)},
-                {"role": "user", "content": _USER_TEMPLATE.format(question=question)},
-            ],
-            temperature=0.2,
-            stream=True,
-        )
-        async for event in stream:
-            delta = event.choices[0].delta.content
-            if delta:
-                yield delta
-
-    @staticmethod
-    def _stub_answer(question: str, context: str) -> str:
-        if "No relevant" in context:
-            return (
-                f"I could not find relevant regulatory text to answer: '{question}'. "
-                "Please try a more specific query or ensure the regulations have been ingested."
-            )
-        return (
-            f"[STUB] Based on the retrieved regulatory context, here is a synthesised "
-            f"answer to '{question}'. In production this response is generated by an LLM "
-            f"using the retrieved DORA/NIS2 articles as grounding."
-        )
+        yield {
+            "done": True,
+            "sources": sources,
+            "query_time_ms": int((time.monotonic() - t0) * 1000),
+        }
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton + convenience functions
+# Helpers
 # ---------------------------------------------------------------------------
 
-_chain: Optional[RegulatoryChain] = None
+
+def _build_citations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract citation metadata from retrieval results."""
+    citations = []
+    for res in results:
+        citations.append(
+            {
+                "regulation": res.get("regulation", ""),
+                "article": _article_label(res),
+                "score": round(res.get("score", 0.0), 4),
+                "citation": format_citation(res),
+            }
+        )
+    return citations
 
 
-def get_chain() -> RegulatoryChain:
-    """Return the global :class:`RegulatoryChain` instance (lazy init)."""
-    global _chain  # noqa: PLW0603
-    if _chain is None:
-        _chain = RegulatoryChain()
-    return _chain
+def _article_label(result: dict[str, Any]) -> str:
+    """Return a compact article label like 'Article 5' or 'Recital 12'."""
+    section_type = (result.get("section_type") or "").capitalize()
+    section_number = result.get("section_number")
+    if section_type and section_number is not None:
+        return f"{section_type} {section_number}"
+    return section_type or ""
 
 
-async def query(
+# ---------------------------------------------------------------------------
+# Module-level convenience
+# ---------------------------------------------------------------------------
+
+_default_chain: Optional[RAGChain] = None
+
+
+def get_chain() -> RAGChain:
+    """Return the global :class:`RAGChain` instance (lazy init)."""
+    global _default_chain
+    if _default_chain is None:
+        _default_chain = RAGChain()
+    return _default_chain
+
+
+def query(
     question: str,
     regulation: Optional[str] = None,
     section_type: Optional[str] = None,
     top_k: int = 5,
     stream: bool = False,
-) -> dict[str, Any]:
-    """Convenience wrapper around the global chain's :meth:`~RegulatoryChain.query`."""
-    return await get_chain().query(
-        question=question,
+) -> Union[dict[str, Any], Iterator[str]]:
+    """Convenience wrapper using a module-level singleton :class:`RAGChain`."""
+    return get_chain().query(
+        question,
         regulation=regulation,
         section_type=section_type,
         top_k=top_k,
         stream=stream,
+    )
+
+
+async def aquery(
+    question: str,
+    regulation: Optional[str] = None,
+    section_type: Optional[str] = None,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Async convenience wrapper."""
+    return await get_chain().aquery(
+        question,
+        regulation=regulation,
+        section_type=section_type,
+        top_k=top_k,
     )
