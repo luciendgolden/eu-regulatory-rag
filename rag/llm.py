@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Generator, Iterator
+from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,11 @@ class OpenAILLMService(LLMService):
 class OllamaLLMService(LLMService):
     """Ollama local LLM backend via HTTP API."""
 
-    def __init__(self, host: str = "http://localhost:11434", model: str = "llama3") -> None:
+    def __init__(
+        self,
+        host: str = "http://localhost:11434",
+        model: str = "llama3",
+    ) -> None:
         self.host = host.rstrip("/")
         self.model = model
 
@@ -176,14 +180,14 @@ def get_llm_service(
     if provider is None or model is None:
         try:
             from config import settings  # type: ignore
-
+        except ImportError:
+            provider = provider or "openai"
+            model = model or "gpt-4o"
+        else:
             provider = provider or settings.llm_provider
             model = model or settings.llm_model
             openai_api_key = openai_api_key or settings.openai_api_key
             ollama_host = ollama_host or settings.ollama_host
-        except Exception:  # noqa: BLE001
-            provider = provider or "openai"
-            model = model or "gpt-4o"
 
     provider = (provider or "openai").lower()
     model = model or "gpt-4o"
