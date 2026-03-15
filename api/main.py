@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
 from typing import Any, Optional
 
@@ -11,6 +12,7 @@ from pydantic import BaseModel, Field
 from rag.retriever import RegulatoryRetriever
 
 logger = logging.getLogger(__name__)
+RETRIEVAL_FAILED_DETAIL = "Retrieval failed."
 
 app = FastAPI(
     title="EU Regulatory RAG API",
@@ -66,8 +68,9 @@ class RootResponse(BaseModel):
     endpoints: dict[str, str]
 
 
+@lru_cache
 def get_retriever() -> RegulatoryRetriever:
-    """Return the default retriever instance."""
+    """Return the shared default retriever instance."""
     return RegulatoryRetriever()
 
 
@@ -110,6 +113,6 @@ def retrieve(
         context = retriever.build_context(results)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Retrieval failed")
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=RETRIEVAL_FAILED_DETAIL) from exc
 
     return RetrieveResponse(query=request.query, results=results, context=context)
