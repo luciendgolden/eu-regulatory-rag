@@ -157,6 +157,33 @@ print(context)
 #   Financial entities shall have in place a sound, comprehensive and well-documented …
 ```
 
+## Running the API
+
+```bash
+uvicorn api.main:app --reload
+```
+
+Example requests:
+
+```bash
+curl http://localhost:8000/health
+
+curl -X POST http://localhost:8000/retrieve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "What are the ICT risk management requirements for financial entities?",
+    "regulation": "DORA",
+    "section_type": "article",
+    "top_k": 3
+  }'
+```
+
+Or start the API together with Qdrant via Docker Compose:
+
+```bash
+docker compose up --build api qdrant
+```
+
 ## Running Tests
 
 ```bash
